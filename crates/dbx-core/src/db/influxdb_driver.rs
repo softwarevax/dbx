@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 use super::with_connection_timeout;
 use crate::models::connection::ConnectionConfig;
 use crate::sql::starts_with_executable_sql_keyword;
-use crate::types::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo};
+use crate::types::{ColumnInfo, DatabaseInfo, QueryMessage, QueryResult, TableInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InfluxdbApiVersion {
     V1,
     V2,
+    V3,
 }
 
 pub struct InfluxdbClient {
@@ -69,12 +70,15 @@ impl InfluxdbClient {
         let version = influxdb_api_version(config.external_config.as_ref());
         let org = influxdb_org(config.external_config.as_ref());
         // InfluxDB 2.x authenticates with a token and scopes requests by org/bucket.
+        // InfluxDB 3.x authenticates with a bearer token and scopes requests by database.
         let (username, password) = match version {
             InfluxdbApiVersion::V1 => (
                 (!config.username.is_empty()).then_some(config.username.clone()),
                 (!config.password.is_empty()).then_some(config.password.clone()),
             ),
-            InfluxdbApiVersion::V2 => (None, (!config.password.is_empty()).then_some(config.password.clone())),
+            InfluxdbApiVersion::V2 | InfluxdbApiVersion::V3 => {
+                (None, (!config.password.is_empty()).then_some(config.password.clone()))
+            }
         };
         let http = build_http_client(Some(&config.ca_cert_path), timeout)?;
         Ok(Self {
@@ -106,6 +110,7 @@ fn build_http_client(ca_cert_path: Option<&str>, timeout: Duration) -> Result<Ht
 fn influxdb_api_version(external_config: Option<&serde_json::Value>) -> InfluxdbApiVersion {
     match external_config.and_then(|value| value.get("version")).and_then(serde_json::Value::as_str).map(str::trim) {
         Some("2" | "v2" | "V2") => InfluxdbApiVersion::V2,
+        Some("3" | "v3" | "V3") => InfluxdbApiVersion::V3,
         _ => InfluxdbApiVersion::V1,
     }
 }
@@ -239,12 +244,47 @@ fn build_v2_query_url(client: &InfluxdbClient) -> Result<String, String> {
     Ok(format!("{}/api/v2/query?org={}", client.base_url, encode_url_param(org)))
 }
 
-fn build_request(client: &InfluxdbClient, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if client.version == InfluxdbApiVersion::V2 {
-        if let Some(token) = client.password.as_deref().map(str::trim).filter(|token| !token.is_empty()) {
-            return req.header("Authorization", format!("Token {token}"));
+/// InfluxDB 3 exposes SQL through `/api/v3/query_sql` and InfluxQL through
+/// `/api/v3/query_influxql`. Both accept the same JSON payload.
+fn build_v3_query_url(client: &InfluxdbClient, language: V3QueryLanguage) -> String {
+    format!("{}/api/v3/{}", client.base_url, language.endpoint())
+}
+
+fn build_v3_databases_url(client: &InfluxdbClient) -> String {
+    format!("{}/api/v3/configure/database?format=json", client.base_url)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V3QueryLanguage {
+    Sql,
+    InfluxQl,
+}
+
+impl V3QueryLanguage {
+    fn endpoint(self) -> &'static str {
+        match self {
+            V3QueryLanguage::Sql => "query_sql",
+            V3QueryLanguage::InfluxQl => "query_influxql",
         }
-        return req;
+    }
+}
+
+#[derive(Serialize)]
+struct V3QueryRequest<'a> {
+    db: &'a str,
+    q: &'a str,
+    format: &'static str,
+}
+
+fn build_request(client: &InfluxdbClient, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if matches!(client.version, InfluxdbApiVersion::V2 | InfluxdbApiVersion::V3) {
+        let Some(token) = client.password.as_deref().map(str::trim).filter(|token| !token.is_empty()) else {
+            // InfluxDB 3 Core can be started with `--without-auth`, so a missing token is not fatal.
+            return req;
+        };
+        // v2 expects the legacy `Token` scheme; v3 standardises on `Bearer`.
+        let scheme = if client.version == InfluxdbApiVersion::V3 { "Bearer" } else { "Token" };
+        return req.header("Authorization", format!("{scheme} {token}"));
     }
     match (&client.username, &client.password) {
         (Some(u), Some(p)) if !u.is_empty() => req.basic_auth(u, Some(p)),
@@ -324,7 +364,175 @@ async fn influx_flux_query(client: &InfluxdbClient, sql: &str) -> Result<QueryRe
     parse_flux_csv(&response_text, start)
 }
 
+async fn influx_v3_query(
+    client: &InfluxdbClient,
+    database: &str,
+    sql: &str,
+    language: V3QueryLanguage,
+) -> Result<QueryResult, String> {
+    let start = Instant::now();
+    let url = build_v3_query_url(client, language);
+    let body = V3QueryRequest { db: database, q: sql, format: "json" };
+    log::info!("[influxdb] v3 query url={url} db={database} language={language:?}");
+    let resp = build_request(client, client.http.post(&url).json(&body))
+        .send()
+        .await
+        .map_err(|e| format!("InfluxDB request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return handle_influx_error(resp).await;
+    }
+    let response_text = resp.text().await.unwrap_or_default();
+    parse_v3_json_rows(&response_text, start)
+}
+
+/// InfluxDB 3 has no SQL `DROP TABLE` or InfluxQL `DROP MEASUREMENT`. Dropping a table is a
+/// management operation performed through `DELETE /api/v3/configure/table`. `hard_delete_at=now`
+/// removes the table immediately instead of leaving a soft-deleted (renamed) placeholder behind.
+async fn delete_table_v3(client: &InfluxdbClient, database: &str, table: &str) -> Result<QueryResult, String> {
+    let db = encode_url_param(database);
+    let table = encode_url_param(table);
+    let url = format!(
+        "{}/api/v3/configure/table?db={}&table={}&hard_delete_at=now",
+        client.base_url, db, table
+    );
+    log::info!("[influxdb] v3 delete table url={url} database={database} table={table}");
+    let start = Instant::now();
+    let resp = build_request(client, client.http.delete(&url))
+        .send()
+        .await
+        .map_err(|e| format!("InfluxDB 3 delete table request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return handle_influx_error(resp).await;
+    }
+    Ok(QueryResult {
+        columns: vec![],
+        column_types: vec![],
+        column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
+        rows: vec![],
+        affected_rows: 1,
+        execution_time_ms: start.elapsed().as_millis(),
+        truncated: false,
+        session_id: None,
+        has_more: false,
+        elasticsearch_raw_body: None,
+        messages: vec![QueryMessage {
+            severity: "INFO".to_string(),
+            message: format!("Dropped table {table} from database {database}"),
+            code: None,
+            detail: None,
+            hint: None,
+        }],
+    })
+}
+
+async fn influx_v3_databases(client: &InfluxdbClient, timeout: Duration) -> Result<Vec<String>, String> {
+    let url = build_v3_databases_url(client);
+    let req = build_request(client, client.http.get(&url));
+    let resp = with_connection_timeout("InfluxDB", timeout, async {
+        req.send().await.map_err(|e| format!("InfluxDB connection failed: {e}"))
+    })
+    .await?;
+    if !resp.status().is_success() {
+        return handle_influx_error(resp).await;
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|e| format!("InfluxDB parse error: {e}; response: {body}"))?;
+    Ok(extract_v3_database_names(&value))
+}
+
+/// InfluxDB 3 has shipped a few shapes for the database listing across releases:
+/// `{"databases": ["a"]}`, `[{"iox::database": "a"}]` and `[{"db_name": "a"}]`.
+/// Accept all of them so the driver keeps working across Core/Enterprise builds.
+fn extract_v3_database_names(value: &serde_json::Value) -> Vec<String> {
+    const NAME_KEYS: [&str; 4] = ["iox::database", "db_name", "database", "name"];
+    let entries = match value {
+        serde_json::Value::Array(items) => items.as_slice(),
+        serde_json::Value::Object(map) => match map.get("databases") {
+            Some(serde_json::Value::Array(items)) => items.as_slice(),
+            _ => &[],
+        },
+        _ => &[],
+    };
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            serde_json::Value::String(name) => Some(name.clone()),
+            serde_json::Value::Object(map) => NAME_KEYS
+                .iter()
+                .find_map(|key| map.get(*key).and_then(serde_json::Value::as_str))
+                .map(str::to_string),
+            _ => None,
+        })
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// `format=json` responses are a JSON array of row objects. `serde_json` is built with
+/// `preserve_order`, so the key order of each object still reflects the projection order.
+fn parse_v3_json_rows(text: &str, start: Instant) -> Result<QueryResult, String> {
+    let trimmed = text.trim();
+    let parsed = if trimmed.is_empty() {
+        serde_json::Value::Array(Vec::new())
+    } else {
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .map_err(|e| format!("InfluxDB parse error: {e}; response: {text}"))?
+    };
+    let records = match parsed {
+        serde_json::Value::Array(items) => items,
+        object @ serde_json::Value::Object(_) => vec![object],
+        serde_json::Value::Null => Vec::new(),
+        other => return Err(format!("InfluxDB returned an unexpected payload: {other}")),
+    };
+
+    let mut columns: Vec<String> = Vec::new();
+    for record in &records {
+        let Some(map) = record.as_object() else { continue };
+        for key in map.keys() {
+            if !columns.iter().any(|existing| existing == key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+
+    let rows = records
+        .iter()
+        .map(|record| {
+            let map = record.as_object();
+            columns
+                .iter()
+                .map(|column| {
+                    map.and_then(|map| map.get(column)).cloned().unwrap_or(serde_json::Value::Null)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    Ok(QueryResult {
+        column_sortables: columns.iter().map(|_| false).collect(),
+        column_types: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
+        columns,
+        affected_rows: rows.len() as u64,
+        rows,
+        execution_time_ms: start.elapsed().as_millis(),
+        truncated: false,
+        session_id: None,
+        has_more: false,
+        elasticsearch_raw_body: None,
+        messages: Vec::new(),
+    })
+}
+
 pub async fn test_connection(client: &InfluxdbClient, timeout: Duration) -> Result<(), String> {
+    if client.version == InfluxdbApiVersion::V3 {
+        influx_v3_databases(client, timeout).await?;
+        return Ok(());
+    }
     if client.version == InfluxdbApiVersion::V2 {
         influx_v2_buckets(client, timeout).await?;
         return Ok(());
@@ -343,6 +551,13 @@ pub async fn test_connection(client: &InfluxdbClient, timeout: Duration) -> Resu
 }
 
 pub async fn list_databases(client: &InfluxdbClient) -> Result<Vec<DatabaseInfo>, String> {
+    if client.version == InfluxdbApiVersion::V3 {
+        return Ok(influx_v3_databases(client, Duration::from_secs(30))
+            .await?
+            .into_iter()
+            .map(|name| DatabaseInfo { name })
+            .collect());
+    }
     if client.version == InfluxdbApiVersion::V2 {
         return Ok(influx_v2_buckets(client, Duration::from_secs(30))
             .await?
@@ -361,6 +576,24 @@ pub async fn list_databases(client: &InfluxdbClient) -> Result<Vec<DatabaseInfo>
 }
 
 pub async fn list_tables(client: &InfluxdbClient, database: &str) -> Result<Vec<TableInfo>, String> {
+    if client.version == InfluxdbApiVersion::V3 {
+        // `iox` is the schema holding user-created tables; `system` and `information_schema`
+        // are server internals and should stay out of the object browser.
+        let query = "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = 'iox' ORDER BY table_name";
+        let result = influx_v3_query(client, database, query, V3QueryLanguage::Sql).await?;
+        return Ok(v3_column_values(&result, "table_name")
+            .into_iter()
+            .filter(|name| !is_v3_soft_deleted_table(name))
+            .map(|name| TableInfo {
+                name,
+                table_type: "TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            })
+            .collect());
+    }
     if client.version == InfluxdbApiVersion::V2 {
         let query = format!(
             "import \"influxdata/influxdb/schema\"\nschema.measurements(bucket: \"{}\", start: 0)",
@@ -399,6 +632,9 @@ pub async fn list_tables(client: &InfluxdbClient, database: &str) -> Result<Vec<
 }
 
 pub async fn get_columns(client: &InfluxdbClient, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+    if client.version == InfluxdbApiVersion::V3 {
+        return get_columns_v3(client, database, table).await;
+    }
     if client.version == InfluxdbApiVersion::V2 {
         return get_columns_v2(client, database, table).await;
     }
@@ -465,6 +701,15 @@ pub async fn get_columns(client: &InfluxdbClient, database: &str, table: &str) -
 }
 
 pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -> Result<QueryResult, String> {
+    if client.version == InfluxdbApiVersion::V3 {
+        // v3 has no DROP statement; route `DROP MEASUREMENT`/`DROP TABLE` to the management API.
+        if let Some(table) = extract_drop_table_name(sql) {
+            return delete_table_v3(client, database, &table).await;
+        }
+        let language =
+            if looks_like_influxql_query(sql) { V3QueryLanguage::InfluxQl } else { V3QueryLanguage::Sql };
+        return influx_v3_query(client, database, sql, language).await;
+    }
     if client.version == InfluxdbApiVersion::V2 && looks_like_flux_query(sql) {
         return influx_flux_query(client, sql).await;
     }
@@ -566,6 +811,118 @@ async fn get_columns_v2(client: &InfluxdbClient, bucket: &str, measurement: &str
     Ok(std::iter::once(time_col).chain(tag_cols).chain(field_cols).collect())
 }
 
+async fn get_columns_v3(client: &InfluxdbClient, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+    let query = format!(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+         WHERE table_schema = 'iox' AND table_name = '{}' ORDER BY ordinal_position",
+        escape_sql_string(table)
+    );
+    let result = influx_v3_query(client, database, &query, V3QueryLanguage::Sql).await?;
+    let name_idx = result.columns.iter().position(|name| name == "column_name");
+    let type_idx = result.columns.iter().position(|name| name == "data_type");
+    let nullable_idx = result.columns.iter().position(|name| name == "is_nullable");
+    let Some(name_idx) = name_idx else { return Ok(Vec::new()) };
+
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let name = row.get(name_idx).and_then(serde_json::Value::as_str)?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let data_type = type_idx
+                .and_then(|idx| row.get(idx))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let is_nullable = nullable_idx
+                .and_then(|idx| row.get(idx))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| !value.eq_ignore_ascii_case("no"))
+                .unwrap_or(true);
+            // In IOx the series key is made up of the timestamp plus the dictionary-encoded tags.
+            let is_primary_key = is_v3_time_column(&name, &data_type) || is_v3_tag_column(&data_type);
+            Some(ColumnInfo {
+                name,
+                data_type: normalize_v3_data_type(&data_type),
+                is_nullable,
+                column_default: None,
+                is_primary_key,
+                extra: None,
+                comment: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: None,
+                enum_values: None,
+                ..Default::default()
+            })
+        })
+        .collect())
+}
+
+fn is_v3_time_column(name: &str, data_type: &str) -> bool {
+    name == "time" || data_type.starts_with("Timestamp")
+}
+
+fn is_v3_tag_column(data_type: &str) -> bool {
+    data_type.starts_with("Dictionary")
+}
+
+/// Arrow type names are accurate but noisy in the UI, so map the common ones to
+/// the friendlier labels the v1/v2 code paths already produce.
+fn normalize_v3_data_type(data_type: &str) -> String {
+    if data_type.starts_with("Timestamp") {
+        return "timestamp".to_string();
+    }
+    if data_type.starts_with("Dictionary") {
+        return "string".to_string();
+    }
+    match data_type {
+        "Utf8" | "LargeUtf8" => "string".to_string(),
+        "Boolean" => "boolean".to_string(),
+        "Float64" | "Float32" => "float".to_string(),
+        "Int64" | "Int32" => "integer".to_string(),
+        "UInt64" | "UInt32" => "unsigned".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn v3_column_values(result: &QueryResult, column: &str) -> Vec<String> {
+    let Some(index) = result.columns.iter().position(|name| name == column) else {
+        return Vec::new();
+    };
+    result
+        .rows
+        .iter()
+        .filter_map(|row| row.get(index).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// InfluxDB 3 defaults to SQL. Only the InfluxQL-specific `SHOW` statements need to be
+/// routed to the InfluxQL endpoint — `SHOW TABLES` is valid DataFusion SQL and stays on
+/// the SQL endpoint.
+fn looks_like_influxql_query(sql: &str) -> bool {
+    let trimmed = sql.trim_start().to_ascii_uppercase();
+    const INFLUXQL_PREFIXES: [&str; 7] = [
+        "SHOW MEASUREMENTS",
+        "SHOW TAG KEYS",
+        "SHOW TAG VALUES",
+        "SHOW FIELD KEYS",
+        "SHOW SERIES",
+        "SHOW DATABASES",
+        "SHOW RETENTION POLICIES",
+    ];
+    INFLUXQL_PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+}
+
 fn escape_flux_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -580,6 +937,45 @@ fn looks_like_flux_query(sql: &str) -> bool {
 
 fn is_influx_system_column(name: &str) -> bool {
     matches!(name, "_start" | "_stop" | "_time" | "_value" | "_field" | "_measurement")
+}
+
+/// Extracts the table name from a `DROP MEASUREMENT`/`DROP TABLE` statement so it can be
+/// routed to the v3 management API. Returns `None` for anything else.
+///
+/// Case-insensitive prefix matching is used for the keywords, but the original-cased table
+/// name is preserved — InfluxDB identifiers are case-sensitive, so uppercasing would target
+/// the wrong table.
+fn extract_drop_table_name(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let rest = upper
+        .strip_prefix("DROP TABLE")
+        .or_else(|| upper.strip_prefix("DROP MEASUREMENT"))?;
+    // Map the matched suffix back onto the original-cased string by byte offset.
+    let offset = upper.len() - rest.len();
+    let after_keyword = &trimmed[offset..];
+    let after_keyword = after_keyword.trim_start();
+    let after_keyword = after_keyword.strip_prefix("IF EXISTS").map(str::trim).unwrap_or(after_keyword);
+    let name = after_keyword.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // Measurement names are usually unquoted, but strip surrounding quotes if present.
+    let name = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(name);
+    Some(name.to_string())
+}
+
+/// InfluxDB 3 soft-deletes a table by renaming it to `<table>-<deleted_at_timestamp>`,
+/// which lingers in `information_schema.tables` until hard deletion. Flag those so they can
+/// be hidden from the object browser as a defense-in-depth measure.
+fn is_v3_soft_deleted_table(name: &str) -> bool {
+    let Some((_, suffix)) = name.rsplit_once('-') else {
+        return false;
+    };
+    // The suffix is an ISO-8601-ish timestamp, e.g. `2025-12-31T23:59:59Z` (len >= 19).
+    suffix.len() >= 19
+        && suffix.starts_with(|c: char| c.is_ascii_digit())
+        && suffix.contains(|c: char| c == 'T' || c == 'Z' || c == '-')
 }
 
 fn flux_column_values(result: &QueryResult, column: &str) -> Vec<String> {
@@ -792,11 +1188,152 @@ mod tests {
         assert_eq!(result.rows[0][4], serde_json::Value::String("42.5".to_string()));
     }
 
+    fn v3_config(external: serde_json::Value) -> ConnectionConfig {
+        serde_json::from_value(json!({
+            "id": "influx-v3",
+            "name": "InfluxDB 3",
+            "db_type": "influxdb",
+            "host": "127.0.0.1",
+            "port": 8181,
+            "username": "ignored-user",
+            "password": "apiv3-token",
+            "database": "sensors",
+            "external_config": external
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn v3_config_uses_bearer_token_and_v3_urls() {
+        let config = v3_config(json!({ "version": "3" }));
+
+        let client = InfluxdbClient::new_for_config("http://localhost:8181/", &config, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(client.version, InfluxdbApiVersion::V3);
+        assert_eq!(client.username, None);
+        assert_eq!(client.password.as_deref(), Some("apiv3-token"));
+        assert_eq!(build_v3_query_url(&client, V3QueryLanguage::Sql), "http://localhost:8181/api/v3/query_sql");
+        assert_eq!(
+            build_v3_query_url(&client, V3QueryLanguage::InfluxQl),
+            "http://localhost:8181/api/v3/query_influxql"
+        );
+        assert_eq!(
+            build_v3_databases_url(&client),
+            "http://localhost:8181/api/v3/configure/database?format=json"
+        );
+    }
+
+    #[test]
+    fn v3_version_accepts_prefixed_alias() {
+        let client =
+            InfluxdbClient::new_for_config("http://localhost:8181", &v3_config(json!({ "version": "v3" })), Duration::from_secs(1))
+                .unwrap();
+
+        assert_eq!(client.version, InfluxdbApiVersion::V3);
+    }
+
+    #[test]
+    fn v3_databases_accepts_all_known_shapes() {
+        let wrapped = json!({ "databases": ["alpha", "beta"] });
+        assert_eq!(extract_v3_database_names(&wrapped), vec!["alpha", "beta"]);
+
+        let iox = json!([{ "iox::database": "sensors" }, { "iox::database": "  " }]);
+        assert_eq!(extract_v3_database_names(&iox), vec!["sensors"]);
+
+        let db_name = json!([{ "db_name": "metrics", "retention_period": "7d" }]);
+        assert_eq!(extract_v3_database_names(&db_name), vec!["metrics"]);
+
+        let plain = json!(["one", "two"]);
+        assert_eq!(extract_v3_database_names(&plain), vec!["one", "two"]);
+
+        assert!(extract_v3_database_names(&json!({ "error": "nope" })).is_empty());
+    }
+
+    #[test]
+    fn parses_v3_json_rows_preserving_column_order() {
+        let body = r#"[
+            {"time":"2026-02-25T20:19:34Z","room":"Kitchen","temp":72.0},
+            {"time":"2026-02-25T20:20:34Z","room":"Living room","temp":71.5,"co":9}
+        ]"#;
+
+        let result = parse_v3_json_rows(body, Instant::now()).unwrap();
+
+        assert_eq!(result.columns, vec!["time", "room", "temp", "co"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.affected_rows, 2);
+        assert_eq!(result.rows[0][1], serde_json::Value::String("Kitchen".to_string()));
+        // Missing keys are padded so every row matches the column count.
+        assert_eq!(result.rows[0].len(), 4);
+        assert_eq!(result.rows[0][3], serde_json::Value::Null);
+        assert_eq!(result.rows[1][3], json!(9));
+    }
+
+    #[test]
+    fn parses_empty_v3_response() {
+        let result = parse_v3_json_rows("", Instant::now()).unwrap();
+
+        assert!(result.columns.is_empty());
+        assert!(result.rows.is_empty());
+        assert_eq!(result.affected_rows, 0);
+    }
+
+    #[test]
+    fn routes_only_influxql_specific_statements_to_influxql() {
+        assert!(looks_like_influxql_query("SHOW MEASUREMENTS"));
+        assert!(looks_like_influxql_query("  show tag keys from cpu"));
+        assert!(looks_like_influxql_query("SHOW FIELD KEYS"));
+        // `SHOW TABLES` is valid DataFusion SQL, so it must stay on the SQL endpoint.
+        assert!(!looks_like_influxql_query("SHOW TABLES"));
+        assert!(!looks_like_influxql_query("SELECT * FROM cpu"));
+    }
+
+    #[test]
+    fn normalizes_arrow_types_for_v3_columns() {
+        assert_eq!(normalize_v3_data_type("Timestamp(Nanosecond, None)"), "timestamp");
+        assert_eq!(normalize_v3_data_type("Dictionary(Int32, Utf8)"), "string");
+        assert_eq!(normalize_v3_data_type("Float64"), "float");
+        assert_eq!(normalize_v3_data_type("Boolean"), "boolean");
+        assert_eq!(normalize_v3_data_type("SomethingElse"), "SomethingElse");
+
+        assert!(is_v3_time_column("time", "Timestamp(Nanosecond, None)"));
+        assert!(is_v3_tag_column("Dictionary(Int32, Utf8)"));
+        assert!(!is_v3_tag_column("Float64"));
+    }
+
+    #[test]
+    fn escapes_single_quotes_in_v3_identifiers() {
+        assert_eq!(escape_sql_string("it's"), "it''s");
+    }
+
     #[test]
     fn recognizes_influx_system_columns() {
         assert!(is_influx_system_column("_start"));
         assert!(is_influx_system_column("_measurement"));
         assert!(!is_influx_system_column("host"));
         assert!(!is_influx_system_column("usage"));
+    }
+
+    #[test]
+    fn extracts_v3_drop_table_name() {
+        assert_eq!(extract_drop_table_name("DROP MEASUREMENT cpu;"), Some("cpu".to_string()));
+        assert_eq!(extract_drop_table_name("drop measurement cpu"), Some("cpu".to_string()));
+        assert_eq!(extract_drop_table_name("DROP TABLE \"my-table\";"), Some("my-table".to_string()));
+        assert_eq!(
+            extract_drop_table_name("DROP MEASUREMENT IF EXISTS sensors;"),
+            Some("sensors".to_string())
+        );
+        assert_eq!(extract_drop_table_name("SELECT * FROM cpu"), None);
+        assert_eq!(extract_drop_table_name("SHOW MEASUREMENTS"), None);
+        assert_eq!(extract_drop_table_name("DROP MEASUREMENT"), None);
+    }
+
+    #[test]
+    fn flags_v3_soft_deleted_tables() {
+        assert!(is_v3_soft_deleted_table("cpu-2025-12-31T23:59:59Z"));
+        assert!(is_v3_soft_deleted_table("sensors-2025-12-31T00:00:00Z"));
+        assert!(!is_v3_soft_deleted_table("cpu"));
+        assert!(!is_v3_soft_deleted_table("my-table"));
+        assert!(!is_v3_soft_deleted_table("cpu-01"));
+        assert!(!is_v3_soft_deleted_table("my-table-2024"));
     }
 }

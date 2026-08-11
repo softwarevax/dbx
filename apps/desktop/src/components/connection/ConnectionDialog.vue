@@ -16,6 +16,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Switch } from "@/components/ui/switch";
 import type { ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, HttpTunnelConfig, IdentifierCase, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
+import { INFLUXDB_DEFAULT_PORTS, influxDbUsesToken, normalizeInfluxDbVersion } from "@/types/influxdb";
 import type { VictoriaMetricsExternalConfig } from "@/types/victoriametrics";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { MqttConnectionConfig } from "@/types/mqtt";
@@ -1472,9 +1473,18 @@ const influxDbOrg = ref("");
 const victoriaMetricsApiPath = ref("/prometheus");
 const victoriaMetricsLookback = ref("1h");
 
+// Set while the form is being populated from a saved connection, so the version watcher
+// below does not overwrite a user's custom port with the version default.
+let influxDbHydrating = false;
+
 function resetInfluxDbFields(config?: Partial<InfluxDbExternalConfig>) {
-  influxDbVersion.value = config?.version === "2" ? "2" : "1";
-  influxDbOrg.value = config?.org?.trim() || "";
+  influxDbHydrating = true;
+  try {
+    influxDbVersion.value = normalizeInfluxDbVersion(config?.version);
+    influxDbOrg.value = config?.org?.trim() || "";
+  } finally {
+    influxDbHydrating = false;
+  }
 }
 
 function hydrateInfluxDbFields(value: unknown) {
@@ -1500,6 +1510,12 @@ function resetDamengJvmOptions(config?: Pick<ConnectionConfig, "agent_java_optio
 }
 
 function buildInfluxDbExternalConfig(): InfluxDbExternalConfig {
+  if (influxDbVersion.value === "3") {
+    // InfluxDB 3 has no org concept, and Core can run with `--without-auth`, so only
+    // the target database is mandatory.
+    if (!form.value.database?.trim()) throw new Error("InfluxDB 3.x database is required");
+    return { version: "3" };
+  }
   if (influxDbVersion.value !== "2") return { version: "1" };
   const org = influxDbOrg.value.trim();
   if (!org) throw new Error("InfluxDB 2.x organization is required");
@@ -1535,12 +1551,24 @@ function buildVictoriaMetricsExternalConfig(): VictoriaMetricsExternalConfig {
   return { apiPath, lookback };
 }
 
-watch(influxDbVersion, (version) => {
-  if (form.value.db_type !== "influxdb") return;
-  if (version === "2") {
-    form.value.username = "";
-  }
-});
+// `flush: "sync"` keeps this in step with the `influxDbHydrating` guard above, which is
+// only held for the duration of the synchronous assignment.
+watch(
+  influxDbVersion,
+  (version, previousVersion) => {
+    if (influxDbHydrating) return;
+    if (form.value.db_type !== "influxdb") return;
+    if (influxDbUsesToken(version)) {
+      form.value.username = "";
+    }
+    // Only follow the version's default port while the user has not set a custom one.
+    const previousDefault = INFLUXDB_DEFAULT_PORTS[previousVersion ?? "1"];
+    if (!form.value.port || form.value.port === previousDefault) {
+      form.value.port = INFLUXDB_DEFAULT_PORTS[version];
+    }
+  },
+  { flush: "sync" },
+);
 
 function requireMqField(value: string, message: string): string {
   const trimmed = value.trim();
@@ -3812,7 +3840,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   } else if (config.db_type === "influxdb") {
     config.external_config = buildInfluxDbExternalConfig();
     config.connection_string = undefined;
-    if (influxDbVersion.value === "2") {
+    if (influxDbUsesToken(influxDbVersion.value)) {
       config.username = "";
       config.password = config.password.trim();
       config.database = config.database?.trim() || undefined;
@@ -6699,6 +6727,7 @@ function openExternalUrl(url: string) {
                       <SelectContent>
                         <SelectItem value="1">InfluxDB 1.x</SelectItem>
                         <SelectItem value="2">InfluxDB 2.x</SelectItem>
+                        <SelectItem value="3">InfluxDB 3.x</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -6714,7 +6743,17 @@ function openExternalUrl(url: string) {
                       <span>{{ t("connection.sslEnable") }}</span>
                     </label>
                   </div>
-                  <template v-if="influxDbVersion === '2'">
+                  <template v-if="influxDbVersion === '3'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.database") }}</Label>
+                      <Input v-model="form.database" class="col-span-3" placeholder="my-database" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Token</Label>
+                      <PasswordInput v-model="form.password" class="col-span-3" />
+                    </div>
+                  </template>
+                  <template v-else-if="influxDbVersion === '2'">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">Organization</Label>
                       <Input v-model="influxDbOrg" class="col-span-3" placeholder="my-org" />
@@ -6742,7 +6781,8 @@ function openExternalUrl(url: string) {
                       <Input v-model="form.database" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
                     </div>
                   </template>
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <!-- v3 sends query parameters in a JSON body, so url_params has no effect there. -->
+                  <div v-if="influxDbVersion !== '3'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.urlParams") }}</Label>
                     <Input v-model="form.url_params" class="col-span-3" :placeholder="influxDbVersion === '2' ? 'precision=ns' : 'epoch=ms'" />
                   </div>
