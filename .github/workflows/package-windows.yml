@@ -3,12 +3,14 @@ name: Package Windows
 # 只构建 Windows 安装包，全程在 GitHub 云端完成，本地无需任何工具/环境。
 # 触发方式：
 #   1. 手动：仓库 Actions 页 -> Package Windows -> Run workflow
-#   2. 打标签：git tag vx.y.z && git push origin vx.y.z
+#   2. 打标签：git tag win-x.y.z && git push origin win-x.y.z
+# 注意：标签用 win- 前缀，避免误触发上游 release.yml（它监听 v* 标签，会去跑
+#       全平台发布流水线并因缺密钥而失败，白白烧 Runner 分钟数）。
 on:
   workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - "win-*"
 
 permissions:
   contents: read

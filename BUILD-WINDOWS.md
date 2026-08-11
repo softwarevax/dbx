@@ -30,16 +30,17 @@
 
 ## 方式二：打标签触发
 
-工作流对 `v*` 开头的标签生效（`on: push: tags: ["v*"]`）。适合想用固定版本号归档时。
+工作流对 **`win-` 开头的标签**生效（`on: push: tags: ["win-*"]`）。适合想用固定版本号归档时。
 
-> ⚠️ **不要复用 `v0.5.81`**：该标签本地已存在（来自 upstream 的旧发布标签），指向的是上游旧提交，不是你 fork 里带本工作流的 `main`。直接 `git tag v0.5.81` 会报 "already exists"，且即使强推也会指向不含 workflow 的提交，触发不了构建。
+> ⚠️ **为什么用 `win-` 前缀，而不是 `v` 前缀？**
+> 上游的 `release.yml` 监听的是 **`v*` 标签**（全平台发布流水线，需要 `TAURI_SIGNING_PRIVATE_KEY` / `APPLE_*` / `DOCKERHUB_*` / `CNB_TOKEN` 等密钥）。如果用 `v0.5.81-win` 这种 `v` 开头标签，会**同时触发 `release.yml`**，而它在 fork 上因缺密钥必然失败，还白白烧 Runner 分钟数。用 `win-v0.5.81`（`win-` 开头）只触发本工作流，干净利落。
 >
-> 用**新的、以 `v` 开头**的标签名，并让它打在**当前 `main` HEAD**（已含 workflow）上即可：
+> ⚠️ **不要复用 `v0.5.81`**：该标签本地已存在（来自 upstream 的旧发布标签），指向上游旧提交，不是你 fork 里带本工作流的 `main`，不能用来触发。
 
 ```bash
-# 在当前 HEAD 上打一个全新的标签（v 开头才会触发）
-git tag v0.5.81-win
-git push origin v0.5.81-win
+# 在当前 HEAD（已含 workflow）上打一个 win- 开头的全新标签
+git tag win-v0.5.81
+git push origin win-v0.5.81
 ```
 
 推送后自动触发 `Package Windows` 工作流，后续下载步骤同方式一。
@@ -47,8 +48,8 @@ git push origin v0.5.81-win
 构建完成后，该标签已无保留必要，可清理（不影响已上传的 Artifact，保留 30 天）：
 
 ```bash
-git tag -d v0.5.81-win
-git push origin :v0.5.81-win
+git tag -d win-v0.5.81
+git push origin :win-v0.5.81
 ```
 
 ---
