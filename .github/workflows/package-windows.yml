@@ -1,0 +1,82 @@
+name: Package Windows
+
+# 只构建 Windows 安装包，全程在 GitHub 云端完成，本地无需任何工具/环境。
+# 触发方式：
+#   1. 手动：仓库 Actions 页 -> Package Windows -> Run workflow
+#   2. 打标签：git tag vx.y.z && git push origin vx.y.z
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-windows:
+    name: Build Windows x64 installer
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Setup Rust (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          cache-on-failure: true
+
+      # 关掉自动更新签名产物，并移除 upstream 的 updater 公钥，
+      # 这样 fork 上没有 Tauri 签名私钥也能正常构建（不影响安装包使用）。
+      - name: Disable updater signing
+        shell: bash
+        run: |
+          jq '.bundle.createUpdaterArtifacts = false | del(.plugins.updater)' \
+            src-tauri/tauri.conf.json > src-tauri/tauri.conf.tmp.json
+          mv src-tauri/tauri.conf.tmp.json src-tauri/tauri.conf.json
+
+      # 主构建：生成 NSIS 安装包（安装时按需下载 WebView2）。
+      - name: Build Tauri app
+        run: pnpm tauri build --target x86_64-pc-windows-msvc
+
+      # 额外生成「自带 WebView2 运行时」的离线安装包，适合无外网环境分发。
+      - name: Build offline WebView2 installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          pnpm tauri bundle --bundles nsis --target x86_64-pc-windows-msvc `
+            --config src-tauri/tauri.webview2-offline.conf.json
+
+      - name: List produced installers
+        shell: pwsh
+        run: |
+          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" -Filter "*.exe" `
+            | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-windows
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*
+          retention-days: 30
+          if-no-files-found: error
