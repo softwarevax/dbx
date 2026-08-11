@@ -4,8 +4,7 @@ name: Package Windows
 # 触发方式：
 #   1. 手动：仓库 Actions 页 -> Package Windows -> Run workflow
 #   2. 打标签：git tag win-x.y.z && git push origin win-x.y.z
-# 注意：标签用 win- 前缀，避免误触发上游 release.yml（它监听 v* 标签，会去跑
-#       全平台发布流水线并因缺密钥而失败，白白烧 Runner 分钟数）。
+# 注意：标签用 win- 前缀，避免误触发上游 release.yml（它监听 v* 标签）。
 on:
   workflow_dispatch:
   push:
@@ -70,15 +69,13 @@ jobs:
             --config src-tauri/tauri.webview2-offline.conf.json
 
       # 调试：列出实际产生的构建产物（帮助排查路径问题）
-      - name: Debug: list all build outputs
+      - name: Debug list build outputs
         shell: pwsh
         run: |
           Write-Host "=== release/bundle contents ==="
-          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -ErrorAction SilentlyContinue `
-            | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
           Write-Host "=== release/*.exe ==="
-          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release" -Filter "*.exe" -ErrorAction SilentlyContinue `
-            | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release" -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
 
       - name: List produced installers
         shell: pwsh
@@ -89,17 +86,21 @@ jobs:
             Get-ChildItem $nsisDir -Filter "*.exe" | ForEach-Object { Write-Host ("NSIS: " + $_.FullName) }
           } else {
             Write-Host "NSIS directory not found, listing all bundle contents..."
-            Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue `
-              | ForEach-Object { Write-Host $_.FullName }
+            Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
           }
 
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4
         with:
           name: dbx-windows
-          # 兜底：优先找 bundle 下所有内容；如果没有则上传 release 目录的 .exe
-          path: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*
-            src-tauri/target/x86_64-pc-windows-msvc/release/*.exe
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Upload raw exe fallback
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-windows-exe
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/*.exe
+          retention-days: 30
+          if-no-files-found: ignore
