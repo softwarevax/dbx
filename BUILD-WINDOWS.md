@@ -30,14 +30,26 @@
 
 ## 方式二：打标签触发
 
-适合想用固定版本号归档时：
+工作流对 `v*` 开头的标签生效（`on: push: tags: ["v*"]`）。适合想用固定版本号归档时。
+
+> ⚠️ **不要复用 `v0.5.81`**：该标签本地已存在（来自 upstream 的旧发布标签），指向的是上游旧提交，不是你 fork 里带本工作流的 `main`。直接 `git tag v0.5.81` 会报 "already exists"，且即使强推也会指向不含 workflow 的提交，触发不了构建。
+>
+> 用**新的、以 `v` 开头**的标签名，并让它打在**当前 `main` HEAD**（已含 workflow）上即可：
 
 ```bash
-git tag v0.5.81
-git push origin v0.5.81
+# 在当前 HEAD 上打一个全新的标签（v 开头才会触发）
+git tag v0.5.81-win
+git push origin v0.5.81-win
 ```
 
-推送 `v*` 标签会自动触发 `Package Windows` 工作流，后续下载步骤同方式一。
+推送后自动触发 `Package Windows` 工作流，后续下载步骤同方式一。
+
+构建完成后，该标签已无保留必要，可清理（不影响已上传的 Artifact，保留 30 天）：
+
+```bash
+git tag -d v0.5.81-win
+git push origin :v0.5.81-win
+```
 
 ---
 
