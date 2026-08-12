@@ -47,76 +47,78 @@ jobs:
           workspaces: "./ -> target"
           cache-on-failure: true
 
-      # ⚠️ 不修改 tauri.conf.json！
-      # createUpdaterArtifacts=true 只影响 updater 签名文件，不影响 NSIS 安装包产出。
-      # 没有签名私钥时 Tauri 会跳过签名但继续正常打包。
-      # 之前用 jq/Python 改配置反而导致 Tauri 静默不产出任何文件。
-
-      # 主构建：原样运行，不传任何签名相关参数
-      # 安装包（.exe/.msi）会在签名步骤之前生成完毕；
-      # 最后的 updater 签名因缺私钥会失败，但 continue-on-error 让流程继续上传。
-      - name: Build Tauri app
-        continue-on-error: true
-        run: pnpm tauri build --target x86_64-pc-windows-msvc
-
-      # 用 bash 搜索并复制安装包（PowerShell 在 Actions 环境可能有兼容问题）
-      - name: Find and copy installers
+      # 核心构建 + 同步复制产物（在同一步骤内完成）
+      # 关键设计：
+      #   1. 不修改 tauri.conf.json（改配置会导致 Tauri 静默不产出安装包）
+      #   2. 用 || true 确保签名失败不阻断
+      #   3. 文件复制紧跟在 build 命令之后、同一步骤内执行
+      #      （避免跨步骤时文件丢失的问题）
+      - name: Build and collect artifacts
         shell: bash
         run: |
           set -x
+
           BASE="src-tauri/target/x86_64-pc-windows-msvc/release"
-          OUTDIR="artifacts"
+          OUTDIR="$GITHUB_WORKSPACE/artifacts"
           mkdir -p "$OUTDIR"
-          
-          echo "=== GITHUB_WORKSPACE = $GITHUB_WORKSPACE ==="
-          echo "=== Listing release dir ==="
-          ls -la "$BASE/" 2>/dev/null || echo "release dir not found"
-          echo "=== Listing bundle dir ==="
-          ls -la "$BASE/bundle/" 2>/dev/null || echo "bundle dir not found"
-          echo "=== Listing nsis dir ==="
-          ls -la "$BASE/bundle/nsis/" 2>/dev/null || echo "nsis dir not found"
-          echo "=== Listing msi dir ==="
-          ls -la "$BASE/bundle/msi/" 2>/dev/null || echo "msi dir not found"
-          
-          FOUND=0
-          
-          # 搜索 NSIS .exe
+
+          echo "=== Starting Tauri build ==="
+          pnpm tauri build --target x86_64-pc-windows-msvc || echo "BUILD_EXIT: $?"
+
+          echo ""
+          echo "=== Searching for build outputs ==="
+          echo "GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
+
+          # 列出 release 目录结构（帮助调试）
+          if [ -d "$BASE" ]; then
+            echo "--- release dir exists, listing ---"
+            find "$BASE" -maxdepth 4 -type f \( -name "*.exe" -o -name "*.msi" \) 2>/dev/null | head -20
+          else
+            echo "WARNING: release dir does not exist: $BASE"
+            # 尝试其他可能的 target 路径
+            echo "--- trying alternate paths ---"
+            ls -la src-tauri/target/ 2>/dev/null | head -10
+            ALT=$(find src-tauri/target -name "bundle" -type d 2>/dev/null | head -3)
+            echo "Found bundle dirs: $ALT"
+          fi
+
+          # 按优先级复制安装包
+          COPIED=0
+
+          # 1) NSIS .exe
           for f in "$BASE"/bundle/nsis/*.exe; do
-            if [ -f "$f" ] && [ "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)" -gt 1048576 ]; then
-              cp "$f" "$OUTDIR/"
-              echo "[OK] NSIS: $(basename "$f")"
-              FOUND=1
+            if [ -f "$f" ]; then
+              sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+              if [ "$sz" -gt 1048576 ]; then
+                cp "$f" "$OUTDIR/"
+                echo "[OK] NSIS: $(basename "$f") ($(( sz / 1048576 )) MB)"
+                COPIED=1
+              fi
             fi
           done
-          
-          # 搜索 MSI
+
+          # 2) MSI
           for f in "$BASE"/bundle/msi/*.msi; do
             if [ -f "$f" ]; then
               cp "$f" "$OUTDIR/"
               echo "[OK] MSI: $(basename "$f")"
-              FOUND=1
+              COPIED=1
             fi
           done
-          
-          # 兜底：递归搜索
-          if [ "$FOUND" = "0" ]; then
-            echo "Standard search empty, recursive fallback..."
-            find "$BASE" \( -name "*.exe" -o -name "*.msi" \) -size +1M \
-              ! -path "*/deps/*" ! -path "*/.cargo/registry/*" 2>/dev/null | while read f; do
-                cp "$f" "$OUTDIR/"
-                echo "[OK] found: $(basename "$f")"
-                FOUND=1
-              done
+
+          # 3) 兜底：裸 .exe（非 deps）
+          if [ "$COPIED" = "0" ] && [ -d "$BASE" ]; then
+            echo "Standard paths empty, broad search..."
+            find "$BASE" -maxdepth 3 -name "*.exe" -size +1M 2>/dev/null | while read f; do
+              cp "$f" "$OUTDIR/"
+              echo "[OK] raw exe: $(basename "$f")"
+            done
           fi
-          
+
           echo ""
-          echo "=== Artifacts contents ==="
-          ls -lh "$OUTDIR/" 2>/dev/null || echo "EMPTY"
-          if [ "$FOUND" = "0" ]; then
-            echo "ERROR: Nothing found!"
-            echo "=== Full recursive listing of release (depth 3) ==="
-            find "$BASE" -maxdepth 3 -type f 2>/dev/null | head -50
-          fi
+          echo "=== Final artifacts ==="
+          ls -lh "$OUTDIR"/ 2>/dev/null || echo "(empty)"
+          echo "DONE"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -124,13 +126,4 @@ jobs:
           name: dbx-windows
           path: artifacts/
           retention-days: 30
-          if-no-files-found: warn
-
-      # 兜底：如果上面的复制+上传失败，直接从原始路径上传
-      - name: Direct upload from bundle (fallback)
-        uses: actions/upload-artifact@v4
-        with:
-          name: dbx-windows-direct
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/
-          retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: error
