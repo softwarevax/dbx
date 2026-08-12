@@ -47,88 +47,105 @@ jobs:
           workspaces: "./ -> target"
           cache-on-failure: true
 
-      # 关掉自动更新签名产物，并移除 upstream 的 updater 公钥，
-      # 这样 fork 上没有 Tauri 签名私钥也能正常构建（不影响安装包使用）。
-      - name: Disable updater signing
-        shell: bash
+      # 用 Python 安全地修改 tauri.conf.json（不用 jq，避免 Windows 路径/编码问题）
+      # 关掉 createUpdaterArtifacts 并移除 updater 插件配置，
+      # 这样 fork 上没有签名私钥也能正常构建 NSIS 安装包。
+      - name: Disable updater signing (Python)
+        shell: pwsh
         run: |
-          jq '.bundle.createUpdaterArtifacts = false | del(.plugins.updater)' \
-            src-tauri/tauri.conf.json > src-tauri/tauri.conf.tmp.json
-          mv src-tauri/tauri.conf.tmp.json src-tauri/tauri.conf.json
+          py -3 -c "import json, pathlib; p=pathlib.Path('src-tauri/tauri.conf.json'); c=json.loads(p.read_text()); print('Before createUpdaterArtifacts=',c['bundle'].get('createUpdaterArtifacts')); print('Before has_updater=','updater' in c.get('plugins',{})); c['bundle']['createUpdaterArtifacts']=False; c.get('plugins',{}).pop('updater',None); p.write_text(json.dumps(c,indent=2)+'\n'); c2=json.loads(p.read_text()); print('After createUpdaterArtifacts=',c2['bundle'].get('createUpdaterArtifacts')); print('After has_updater=','updater' in c2.get('plugins',{})); print('JSON valid OK')"
 
-      # 验证修改后的 JSON 合法性
-      - name: Verify config JSON
-        shell: bash
-        run: |
-          jq empty src-tauri/tauri.conf.json && echo "JSON is valid" || echo "JSON INVALID"
-          cat src-tauri/tauri.conf.json | head -30
-
-      # 主构建：生成 NSIS 安装包（安装时按需下载 WebView2）。
+      # 主构建：生成 NSIS 安装包
       - name: Build Tauri app
         run: pnpm tauri build --target x86_64-pc-windows-msvc
 
-      # 调试：递归搜索整个 target 目录下所有 .exe 和 .msi 文件
+      # 递归搜索整个 target 目录下所有可执行文件，确定实际产物位置
       - name: Debug find all executables
         shell: pwsh
         run: |
-          Write-Host "=== All .exe under target ==="
-          Get-ChildItem "src-tauri/target" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          $base = "src-tauri/target/x86_64-pc-windows-msvc"
+          Write-Host "=== All .exe under target (recursive) ==="
+          Get-ChildItem "$base" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '[\\/]deps[\\/]' -and $_.FullName -notmatch '[\\/].cargo[\\/]registry' } |
+            ForEach-Object { Write-Host ("  " + $_.FullName + "  (" + [math]::Round($_.Length/1MB, 1) + " MB)") }
+          Write-Host ""
           Write-Host "=== All .msi under target ==="
-          Get-ChildItem "src-tauri/target" -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-          Write-Host "=== release dir listing ==="
-          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
-          Write-Host "=== bundle dir listing ==="
-          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
+          Get-ChildItem "$base" -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("  " + $_.FullName + "  (" + [math]::Round($_.Length/1MB, 1) + " MB)") }
+          Write-Host ""
+          Write-Host "=== release/ dir contents ==="
+          Get-ChildItem "$base/release" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("  " + $_.FullName) }
+          Write-Host ""
+          Write-Host "=== release/bundle/ dir contents ==="
+          Get-ChildItem "$base/release/bundle" -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("  " + $_.FullName) }
 
-      # 用 PowerShell 搜索并上传所有找到的可执行文件（不依赖固定路径）
-      - name: Collect and upload build artifacts
+      # 用 PowerShell 收集所有找到的可执行文件到 artifacts 目录再统一上传
+      - name: Collect artifacts
         shell: pwsh
         run: |
-          $targetDir = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          $base = "src-tauri/target/x86_64-pc-windows-msvc/release"
           $outDir = "$env:GITHUB_WORKSPACE\artifacts"
           New-Item -ItemType Directory -Path $outDir -Force | Out-Null
           
           $found = $false
           
-          # 1. 找 NSIS 安装包 (.exe in nsis/)
-          $nsisExes = Get-ChildItem "$targetDir\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
+          # 优先找 NSIS 安装包
+          $nsisExes = Get-ChildItem "$base\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
           if ($nsisExes) {
-            foreach ($f in $nsisExes) { Copy-Item $f.FullName $outDir\; Write-Host "Found NSIS: $($f.Name)" }
+            foreach ($f in $nsisExes) {
+              Copy-Item $f.FullName "$outDir\$($f.Name)"
+              Write-Host "[OK] NSIS: $($f.Name) ($([math]::Round($f.Length/1MB, 1)) MB)"
+            }
             $found = $true
           }
           
-          # 2. 找 MSI
-          $msiFiles = Get-ChildItem $targetDir -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue
-          if ($msiFiles) {
-            foreach ($f in $msiFiles) { Copy-Item $f.FullName $outDir\; Write-Host "Found MSI: $($f.Name)" }
-            $found = $true
-          }
-          
-          # 3. 兜底：找裸 exe（不含测试和依赖）
+          # 找 MSI
           if (-not $found) {
-            $rawExe = Get-ChildItem $targetDir -Filter "*.exe" -Depth 0 -ErrorAction SilentlyContinue
+            $msiFiles = Get-ChildItem $base -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue
+            if ($msiFiles) {
+              foreach ($f in $msiFiles) {
+                Copy-Item $f.FullName "$outDir\$($f.Name)"
+                Write-Host "[OK] MSI: $($f.Name)"
+              }
+              $found = $true
+            }
+          }
+          
+          # 兜底：release 根目录裸 exe
+          if (-not $found) {
+            $rawExe = Get-ChildItem $base -Filter "*.exe" -Depth 0 -ErrorAction SilentlyContinue
             if ($rawExe) {
-              foreach ($f in $rawExe) { Copy-Item $f.FullName $outDir\; Write-Host "Found raw exe: $($f.Name)" }
+              foreach ($f in $rawExe) {
+                Copy-Item $f.FullName "$outDir\$($f.Name)"
+                Write-Host "[OK] raw exe: $($f.Name) ($([math]::Round($f.Length/1MB, 1)) MB)"
+              }
               $found = $true
             }
           }
           
-          # 4. 再兜底：递归找任何非 deps 的 exe
+          # 最终兜底：递归搜索非依赖 exe
           if (-not $found) {
-            $allExes = Get-ChildItem $targetDir -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object {
-              $_.FullName -notmatch '[\\/]deps[\\/]' -and $_.FullName -notmatch '[\\/].cargo[\\/]registry'
-            }
+            $allExes = Get-ChildItem $base -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '[\\/]deps[\\/]' -and $_.FullName -notmatch '[\\/].cargo[\\/]registry' }
             if ($allExes) {
-              foreach ($f in $allExes) { Copy-Item $f.FullName $outDir\; Write-Host "Found exe: $($f.Name)" }
+              foreach ($f in $allExes) {
+                Copy-Item $f.FullName "$outDir\$($f.Name)"
+                Write-Host "[OK] found exe: $($f.Name) ($([math]::Round($f.Length/1MB, 1)) MB)"
+              }
               $found = $true
             }
           }
           
+          Write-Host ""
           if ($found) {
-            Get-ChildItem $outDir | ForEach-Object { Write-Host ("Artifact: " + $_.Name + " (" + [math]::Round($_.Length/1MB, 1) + " MB)") }
+            Write-Host "=== Artifacts collected ==="
+            Get-ChildItem $outDir | ForEach-Object { Write-Host ("  " + $_.Name + "  (" + [math]::Round($_.Length/1MB, 1) + " MB)") }
           } else {
-            Write-Host "WARNING: No artifacts found anywhere!"
-            Get-ChildItem $targetDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
+            Write-Host "ERROR: No artifacts found anywhere!"
+            Write-Host "=== release/ listing ==="
+            Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
           }
 
       - name: Upload artifacts
