@@ -56,51 +56,85 @@ jobs:
             src-tauri/tauri.conf.json > src-tauri/tauri.conf.tmp.json
           mv src-tauri/tauri.conf.tmp.json src-tauri/tauri.conf.json
 
+      # 验证修改后的 JSON 合法性
+      - name: Verify config JSON
+        shell: bash
+        run: |
+          jq empty src-tauri/tauri.conf.json && echo "JSON is valid" || echo "JSON INVALID"
+          cat src-tauri/tauri.conf.json | head -30
+
       # 主构建：生成 NSIS 安装包（安装时按需下载 WebView2）。
       - name: Build Tauri app
         run: pnpm tauri build --target x86_64-pc-windows-msvc
 
-      # 额外生成「自带 WebView2 运行时」的离线安装包，适合无外网环境分发。
-      - name: Build offline WebView2 installer
-        continue-on-error: true
+      # 调试：递归搜索整个 target 目录下所有 .exe 和 .msi 文件
+      - name: Debug find all executables
         shell: pwsh
         run: |
-          pnpm tauri bundle --bundles nsis --target x86_64-pc-windows-msvc `
-            --config src-tauri/tauri.webview2-offline.conf.json
+          Write-Host "=== All .exe under target ==="
+          Get-ChildItem "src-tauri/target" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          Write-Host "=== All .msi under target ==="
+          Get-ChildItem "src-tauri/target" -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          Write-Host "=== release dir listing ==="
+          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
+          Write-Host "=== bundle dir listing ==="
+          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
 
-      # 调试：列出实际产生的构建产物（帮助排查路径问题）
-      - name: Debug list build outputs
+      # 用 PowerShell 搜索并上传所有找到的可执行文件（不依赖固定路径）
+      - name: Collect and upload build artifacts
         shell: pwsh
         run: |
-          Write-Host "=== release/bundle contents ==="
-          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-          Write-Host "=== release/*.exe ==="
-          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release" -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-
-      - name: List produced installers
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $nsisDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
-          if (Test-Path $nsisDir) {
-            Get-ChildItem $nsisDir -Filter "*.exe" | ForEach-Object { Write-Host ("NSIS: " + $_.FullName) }
+          $targetDir = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          $outDir = "$env:GITHUB_WORKSPACE\artifacts"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          
+          $found = $false
+          
+          # 1. 找 NSIS 安装包 (.exe in nsis/)
+          $nsisExes = Get-ChildItem "$targetDir\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
+          if ($nsisExes) {
+            foreach ($f in $nsisExes) { Copy-Item $f.FullName $outDir\; Write-Host "Found NSIS: $($f.Name)" }
+            $found = $true
+          }
+          
+          # 2. 找 MSI
+          $msiFiles = Get-ChildItem $targetDir -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue
+          if ($msiFiles) {
+            foreach ($f in $msiFiles) { Copy-Item $f.FullName $outDir\; Write-Host "Found MSI: $($f.Name)" }
+            $found = $true
+          }
+          
+          # 3. 兜底：找裸 exe（不含测试和依赖）
+          if (-not $found) {
+            $rawExe = Get-ChildItem $targetDir -Filter "*.exe" -Depth 0 -ErrorAction SilentlyContinue
+            if ($rawExe) {
+              foreach ($f in $rawExe) { Copy-Item $f.FullName $outDir\; Write-Host "Found raw exe: $($f.Name)" }
+              $found = $true
+            }
+          }
+          
+          # 4. 再兜底：递归找任何非 deps 的 exe
+          if (-not $found) {
+            $allExes = Get-ChildItem $targetDir -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object {
+              $_.FullName -notmatch '[\\/]deps[\\/]' -and $_.FullName -notmatch '[\\/].cargo[\\/]registry'
+            }
+            if ($allExes) {
+              foreach ($f in $allExes) { Copy-Item $f.FullName $outDir\; Write-Host "Found exe: $($f.Name)" }
+              $found = $true
+            }
+          }
+          
+          if ($found) {
+            Get-ChildItem $outDir | ForEach-Object { Write-Host ("Artifact: " + $_.Name + " (" + [math]::Round($_.Length/1MB, 1) + " MB)") }
           } else {
-            Write-Host "NSIS directory not found, listing all bundle contents..."
-            Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            Write-Host "WARNING: No artifacts found anywhere!"
+            Get-ChildItem $targetDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
           }
 
-      - name: Upload Windows installers
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dbx-windows
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/
+          path: artifacts/
           retention-days: 30
           if-no-files-found: warn
-
-      - name: Upload raw exe fallback
-        uses: actions/upload-artifact@v4
-        with:
-          name: dbx-windows-exe
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/*.exe
-          retention-days: 30
-          if-no-files-found: ignore
