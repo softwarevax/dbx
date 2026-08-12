@@ -53,11 +53,11 @@ jobs:
       # 之前用 jq/Python 改配置反而导致 Tauri 静默不产出任何文件。
 
       # 主构建：原样运行，不传任何签名相关参数
+      # 安装包（.exe/.msi）会在签名步骤之前生成完毕；
+      # 最后的 updater 签名因缺私钥会失败，但 continue-on-error 让流程继续上传。
       - name: Build Tauri app
+        continue-on-error: true
         run: pnpm tauri build --target x86_64-pc-windows-msvc
-        env:
-          # 明确不设签名私钥 → updater 签名步骤会被跳过，安装包正常产出
-          TAURI_SIGNING_PRIVATE_KEY: ""
 
       # 搜索并上传所有产物
       - name: Find and upload installers
