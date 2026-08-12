@@ -59,63 +59,64 @@ jobs:
         continue-on-error: true
         run: pnpm tauri build --target x86_64-pc-windows-msvc
 
-      # 搜索并上传所有产物
-      - name: Find and upload installers
-        shell: pwsh
+      # 用 bash 搜索并复制安装包（PowerShell 在 Actions 环境可能有兼容问题）
+      - name: Find and copy installers
+        shell: bash
         run: |
-          $base = "src-tauri/target/x86_64-pc-windows-msvc/release"
-          $outDir = "$env:GITHUB_WORKSPACE\artifacts"
-          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          set -x
+          BASE="src-tauri/target/x86_64-pc-windows-msvc/release"
+          OUTDIR="artifacts"
+          mkdir -p "$OUTDIR"
           
-          Write-Host "=== Searching for build outputs ==="
+          echo "=== GITHUB_WORKSPACE = $GITHUB_WORKSPACE ==="
+          echo "=== Listing release dir ==="
+          ls -la "$BASE/" 2>/dev/null || echo "release dir not found"
+          echo "=== Listing bundle dir ==="
+          ls -la "$BASE/bundle/" 2>/dev/null || echo "bundle dir not found"
+          echo "=== Listing nsis dir ==="
+          ls -la "$BASE/bundle/nsis/" 2>/dev/null || echo "nsis dir not found"
+          echo "=== Listing msi dir ==="
+          ls -la "$BASE/bundle/msi/" 2>/dev/null || echo "msi dir not found"
           
-          $found = $false
+          FOUND=0
           
-          # 按优先级搜索
-          $patterns = @(
-            @{ Path = "$base\bundle\nsis"; Filter = "*.exe"; Label = "NSIS" },
-            @{ Path = "$base\bundle\msi"; Filter = "*.msi"; Label = "MSI" },
-            @{ Path = "$base\bundle";     Filter = "*.exe"; Label = "Bundle EXE" },
-            @{ Path = "$base";           Filter = "*.exe"; Label = "Raw EXE" },
-            @{ Path = "$base";           Filter = "*.msi"; Label = "Raw MSI" }
-          )
+          # 搜索 NSIS .exe
+          for f in "$BASE"/bundle/nsis/*.exe; do
+            if [ -f "$f" ] && [ "$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)" -gt 1048576 ]; then
+              cp "$f" "$OUTDIR/"
+              echo "[OK] NSIS: $(basename "$f")"
+              FOUND=1
+            fi
+          done
           
-          foreach ($p in $patterns) {
-            $files = Get-ChildItem "$($p.Path)\$($p.Filter)" -ErrorAction SilentlyContinue
-            if ($files) {
-              foreach ($f in $files) {
-                if ($f.Length -gt 1MB) {
-                  Copy-Item $f.FullName "$outDir\$($f.Name)" -Force
-                  Write-Host "[OK] [$($p.Label)] $($f.Name) ($([math]::Round($f.Length/1MB, 1)) MB)"
-                  $found = $true
-                }
-              }
-            }
-          }
+          # 搜索 MSI
+          for f in "$BASE"/bundle/msi/*.msi; do
+            if [ -f "$f" ]; then
+              cp "$f" "$OUTDIR/"
+              echo "[OK] MSI: $(basename "$f")"
+              FOUND=1
+            fi
+          done
           
-          # 兜底递归搜索
-          if (-not $found) {
-            Write-Host "Standard search empty, recursive fallback..."
-            $all = Get-ChildItem $base -Recurse -Include "*.exe","*.msi" -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -notmatch '[\\/]deps[\\/]' -and $_.FullName -notmatch '[\\/].cargo[\\/]registry' -and $_.Length -gt 1MB }
-            if ($all) {
-              foreach ($f in $all) {
-                Copy-Item $f.FullName "$outDir\$($f.Name)" -Force
-                Write-Host "[OK] [recursive] $($f.Name) ($([math]::Round($f.Length/1MB, 1)) MB)"
-                $found = $true
-              }
-            }
-          }
+          # 兜底：递归搜索
+          if [ "$FOUND" = "0" ]; then
+            echo "Standard search empty, recursive fallback..."
+            find "$BASE" \( -name "*.exe" -o -name "*.msi" \) -size +1M \
+              ! -path "*/deps/*" ! -path "*/.cargo/registry/*" 2>/dev/null | while read f; do
+                cp "$f" "$OUTDIR/"
+                echo "[OK] found: $(basename "$f")"
+                FOUND=1
+              done
+          fi
           
-          Write-Host ""
-          if ($found) {
-            Write-Host "=== Artifacts ready ==="
-            Get-ChildItem $outDir | ForEach-Object { Write-Host ("  " + $_.Name + "  (" + [math]::Round($_.Length/1MB, 1) + " MB)") }
-          } else {
-            Write-Host "ERROR: No artifacts found at all!"
-            Write-Host "--- release dir listing (depth 2) ---"
-            Get-ChildItem $base -Recurse -Depth 2 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  " + $_.FullName) }
-          }
+          echo ""
+          echo "=== Artifacts contents ==="
+          ls -lh "$OUTDIR/" 2>/dev/null || echo "EMPTY"
+          if [ "$FOUND" = "0" ]; then
+            echo "ERROR: Nothing found!"
+            echo "=== Full recursive listing of release (depth 3) ==="
+            find "$BASE" -maxdepth 3 -type f 2>/dev/null | head -50
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -124,3 +125,12 @@ jobs:
           path: artifacts/
           retention-days: 30
           if-no-files-found: warn
+
+      # 兜底：如果上面的复制+上传失败，直接从原始路径上传
+      - name: Direct upload from bundle (fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-windows-direct
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/
+          retention-days: 30
+          if-no-files-found: ignore
